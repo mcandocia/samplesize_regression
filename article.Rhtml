@@ -1,0 +1,515 @@
+<script
+  src="https://code.jquery.com/jquery-3.5.1.min.js"
+  integrity="sha256-9/aliU8dGd2tb6OSsuzixeV4y/faTqgFtohetphbbj0="
+  crossorigin="anonymous"></script>
+  
+<style>
+ /* modified version of bootstrap table CSS to avoid issues with overall page CSS */
+ .table-striped{
+ --bs-table-bg: transparent;
+  --bs-table-accent-bg: transparent;
+  --bs-table-striped-color: #212529;
+  --bs-table-striped-bg: rgba(0, 0, 0, 0.05);
+  --bs-table-active-color: #212529;
+  --bs-table-active-bg: rgba(0, 0, 0, 0.1);
+  --bs-table-hover-color: #212529;
+  --bs-table-hover-bg: rgba(0, 0, 0, 0.075);
+  width: 100%;
+  margin-bottom: 1rem;
+  color: #212529;
+  vertical-align: top;
+  border-color: #dee2e6;
+}
+
+.table-striped > :not(caption) > * > * {
+  padding: 0.5rem 0.5rem;
+  background-color: var(--bs-table-bg);
+  background-image: linear-gradient(var(--bs-table-accent-bg), var(--bs-table-accent-bg));
+  border-bottom-width: 1px;
+}
+  
+  .table > tbody {
+  vertical-align: inherit;
+}
+.table-striped > thead {
+  vertical-align: bottom;
+}
+.table-striped > :not(:last-child) > :last-child > * {
+  border-bottom-color: currentColor;
+}
+
+.table-striped > tbody > tr:nth-of-type(odd) {
+  --bs-table-accent-bg: var(--bs-table-striped-bg);
+  color: var(--bs-table-striped-color);
+}
+
+
+</style>
+
+<!--begin.rcode lib, echo=FALSE, warning=FALSE, message=FALSE, cache=FALSE
+library(tidyverse)
+library(lubridate)
+library(cetcolor)
+library(glmnet)
+library(glmnetUtils)
+end.rcode-->
+
+<!--begin.rcode setup, echo=FALSE, warning=FALSE, message=FALSE, cache=TRUE
+
+dir.create('figure',showWarnings=FALSE)
+
+
+# utility functions
+roundTo <- function(x, precision){
+  (x %/% precision) * precision
+}
+pad2 <- function(x) stringr::str_pad(x, 2, pad='0')
+
+# load data
+df = read_csv('thread_data_authored.csv')
+
+domain_list = table(df$domain)
+low_freq_domains = names(domain_list)[domain_list < 50]
+high_freq_domains = sort(names(domain_list)[domain_list >= 50])
+
+df = df %>%
+  filter(created >= '2020-04-01') %>%
+  filter(difftime(timestamp, created,  units='hours') %>% as.numeric() >= 0.8 * 24) %>%
+  arrange(created) %>%
+  mutate(
+    category = case_when(
+      grepl('[results]', tolower(title), fixed=TRUE) ~ 'RESULTS',
+      grepl('[casual]', tolower(title), fixed=TRUE) ~ 'CASUAL',
+      grepl('[academic]', tolower(title), fixed=TRUE) ~ 'ACADEMIC',
+      grepl('[marketing]', tolower(title), fixed=TRUE) ~ 'MARKETING',
+      TRUE ~ 'OTHER'
+    ),
+    is_repost = grepl('repost', tolower(title)) * 1,
+    title_length=nchar(title),
+    logscore = log(1+pmax(score, -0.5)),
+    hour = hour(created_utc) %>% as.factor(),
+    dow = weekdays(created_utc) %>%
+      factor(levels=c('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')),
+    domain_clean = ifelse(domain %in% low_freq_domains, 'LOW_FREQ', domain) %>%
+      factor(levels=c('LOW_FREQ',high_freq_domains)),
+    giftcard = 1 * grepl('card', tolower(title)),
+    author_has_flair = 1*(!is.na(author_flair_css_class)),
+    over20 = factor(1 * (score > 20)),
+    over10 = factor(1 * (score > 10)),
+    no_qm_url = gsub('\\?.*','', url),
+    self = 1 * is_self,
+    inclusive_audience = 1 * grepl('\\(((all|everyone|everybody) ?(welcome)?[^)]*)\\)', 
+                                   tolower(title)),
+    survey_in_title = 1 * grepl('survey', tolower(title)),
+    hour3=sprintf(
+      '%s-%s', 
+      roundTo(as.numeric(as.character(hour)),3) %>% pad2(),
+      (roundTo(as.numeric(as.character(hour)),3)+3) %>% pad2()
+    ),
+    dow_hour = paste(dow, hour3, sep='_')
+  ) %>%
+  group_by(author_name, no_qm_url) %>%
+  mutate(
+    n_reposts = 1:n() - 1
+  ) %>%
+  group_by(author_name) %>%
+  mutate(
+    post_freq = 1:n() - 1
+  ) %>%
+  ungroup()
+
+
+MODEL_VARS = c('category','is_repost','title_length','hour3','dow','domain_clean','author_has_flair','n_reposts','self','inclusive_audience','survey_in_title', 'dow_hour')
+
+if (FALSE){
+  data_contrasts = df %>% 
+    select_at(MODEL_VARS) %>%
+    mutate_if(is.character, as.factor) %>%
+    select_if(is.factor) %>%
+    lapply(contrasts, contrasts=FALSE)
+  
+  model_frame = model.matrix(
+    ~ . + 0,
+   df %>% 
+    select_at(MODEL_VARS) %>%
+    mutate_if(is.character, as.factor),
+   constrasts.arg=data_contrasts
+  )
+  
+  cvnet_model = cva.glmnet(x=model_frame, y=df$logscore,
+                            gamma = seq(0,1,0.05), alpha=seq(0,1,0.25))
+  
+  cvnet_model10 = cva.glmnet(x=model_frame, y=df$over10 %>% as.character() %>% as.numeric(), 
+                            type.measure='class',
+                            family='binomial',
+                            gamma = seq(0,1,0.05), alpha=seq(0,1,0.25))
+  
+  
+  coefs = coef(cvnet_model) %>% 
+    as.matrix() %>% 
+    as.data.frame.matrix() %>% 
+    rownames_to_column('variable') %>% 
+    rename(value=2)
+}
+
+model=glm(logscore ~ category + is_repost + title_length + 
+            hour3 + dow + domain_clean + author_has_flair + 
+            n_reposts + self + inclusive_audience + dow:hour3 +
+            survey_in_title, data = df) %>%
+  step(direction='both', trace=0, k=log(nrow(df)))
+#summary(model)
+
+df$predlogscore = predict(model, df)
+
+rexp <- function(x) exp(x) - 1
+
+model10=glm(over10 ~ category + is_repost + title_length + 
+              hour3 * dow + domain_clean + author_has_flair + 
+              n_reposts + self +  inclusive_audience + dow:hour3 +
+              survey_in_title + category*is_repost*inclusive_audience, data = df,
+            family=binomial) %>%
+  step(direction='both', trace=0, k=log(nrow(df)))
+
+#summary(model10)
+
+df$pred_over10 = predict(model10, df, type='response')
+
+df_rank = df %>% arrange(
+  score
+) %>%
+  mutate(
+    color=ifelse(
+      author_name=='antirabbit','red','black'
+    ),
+    score_ranking = rank(score)
+  )
+
+#with(df_rank, plot(score_ranking, pred_over20, col=color))
+coef_data = summary(model) %>% 
+  coef() %>% 
+  as.data.frame() %>% 
+  rownames_to_column('coefficient') %>% 
+  rename(estimate=2,error=3,tval=4,pt=5) %>%
+  filter(coefficient != '(Intercept)') %>%
+  mutate(
+    category=case_when(
+      grepl('^category', coefficient) ~ 'Survey Category\n(vs. ACADEMIC)',
+      grepl('^domain_clean', coefficient) ~ 'Website\n(vs. other sites)',
+      TRUE ~ 'General'
+    ),
+    coef_level = gsub('^(category|domain_clean|hour3|dow|dow_hour)(.+)','\\2', coefficient),
+    upper_est = estimate + 1.96 * error,
+    lower_est = estimate - 1.96 * error
+  )
+
+coef_data10 = summary(model10) %>% 
+  coef() %>% 
+  as.data.frame() %>% 
+  rownames_to_column('coefficient') %>% 
+  rename(estimate=2,error=3,tval=4,pt=5) %>%
+  filter(coefficient != '(Intercept)') %>%
+  mutate(
+    category=case_when(
+      grepl('^category', coefficient) ~ 'Survey Category\n(vs. ACADEMIC)',
+      grepl('^domain_clean', coefficient) ~ 'Website\n(vs. other sites)',
+      TRUE ~ 'General'
+    ),
+    coef_level = gsub('^(category|domain_clean|hour3|dow|dow_hour)(.+)','\\2', coefficient),
+    upper_est = estimate + 1.96 * error,
+    lower_est = estimate - 1.96 * error
+  )
+
+
+
+ppng <- function(x, ...){
+  png(file.path('figure',x),width=720, height=960, res=200, ...)
+}
+
+# hour/day tile plot
+
+dh_summary = df %>%
+  filter(year(created_utc) == 2020 & month(created_utc) >= 3) %>%
+  group_by(hour3, dow) %>%
+  summarize(
+    count=n(),
+    avg_score=mean(score),
+    avg_score20=mean(score>20),
+    avg_score10=mean(score>10),
+    median_score=median(score),
+    avg_score50=mean(score>50),
+    Q1_score = quantile(score, 0.25),
+    Q3_score = quantile(score, 0.75)
+  ) %>%
+  ungroup()
+
+end.rcode-->
+
+<p> If you want to get more responses for your survey, you can always check out <a href="https://old.reddit.com/r/samplesize" id="r_samplesize_out" target="_blank">/r/samplesize</a> on Reddit, where of the respondents are in the younger demographics (18-34), mainly from English-speaking countries. The political lean of the site is generally, but not exclusively, to the left.</p>
+
+<p> How to get the most out of the subreddit is a bit less obvious. Namely, there are a few rules that you need to follow when posting:</p>
+
+<ol id="rules_list">
+ <li>Your survey link must have a valid URL that matches the destination, which must be a well-trusted survey-collection site, like Qualtric, SurveyMonkey, Google Docs, etc.</li>
+ <li>Your survey must be categorized as <code>[Casual]</code>, <code>[Marketing]</code>, or <code>[Academic]</code>, with one of those respective tags in the title</li>
+ <li>You must indicate what demographics/conditions for responders are in the title</li>
+ <li>You can only repost it once every 24 hours, provided it is no longer one of the top 25 "hot" posts on the subreddit</li>
+ <li>If you do repost, you must indicate it with a <code>[Repost]</code> tag in the title</li>
+</ol>
+
+<p> For example, you could have a survey titled <code>[Academic] How much do you sleep per day (Anyone 18+)</code>, or <code>[Repost][Marketing] What kind of fish do you eat? (anyone living in US).</code></p>
+
+<p> There are additional rules for posting, but these are the ones to keep in mind when setting a strategy for posting</p>
+
+<h1> Ideal Outcome </h1>
+
+<p>Usually I don't get more than a few dozen responses, although in a few cases I've gotten several hundred. The most important factor in getting responses is getting more upvotes, thus a higher score, on your submission.</p>
+
+<p> The Reddit algorithm will push newer posts up closer to the top of people's pages, as well as posts with higher scores. The process is a positive feedback loop: The higher score you have, the more likely people are to see your post and upvote it and/or fill it out.</p>
+
+<p>There is the question of what the best way to post your survey is. Here are a few guidelines + observations, and then I will back up these claims with data:</p>
+
+<ul id="guidelines_list">
+ <li>"Casual" posts do much better than "Academic". "Marketing" posts tend to do the worst.</li>
+ <li>Including a wider audience in your survey will help.</li>
+ <li>A survey being reposted significantly decreases its potential. This might be due to why a survey is reposted in the first place, i.e., why would someone repost a survey after it's successful?
+ </li>
+ <li>If you have a "Shares Results" flair, that will significantly boost the likelihood of your post getting > 10 upvotes </li>
+ <li><a href="strawpoll.me" id="strawpoll_out" target="_blank">strawpoll.me</a> links seem to perform well. Granted, you can only ask one question with this site.</li>
+ <li>Posts on Saturday, 6:00-15:00 UTC (2:00 am- 11:00 am EST) have a tendency to score higher.</li>
+</ul>
+
+<h1> Posting Time </h1>
+
+<p> Below is a graph of different posting times and the percentage of submissions with scores over 10. The inter-quartile range (IQR) is in the middle of each tile, and the bottom is the total number of samples. <b>Tap on the image to show more details in each cell</b>. </p>
+
+<!--begin.rcode best_time_graph, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=9
+
+ppng('detailed_time_tiles.png')
+print(
+ggplot(
+  dh_summary %>%
+   mutate(
+     label=sprintf(
+       '%s\nIQR=(%s-%s)\nn=%s\nAvg=%s',
+       scales::percent(avg_score10, 0.1),
+       round(Q1_score,1),
+       round(Q3_score,1),
+       count,
+       round(avg_score, 1)
+     )
+   )
+  ) + 
+  geom_tile(aes(x=dow,y=hour3,fill=avg_score10)) +
+  scale_fill_gradientn(
+    '% of posts with\nscore>10',
+    colors=cet_pal(7, 'cbtd1'), 
+    label=scales::percent
+  ) + 
+  geom_text(aes(x=dow,y=hour3, label=label),
+            size=1.15) + 
+  theme_bw() + 
+  xlab('Day of Week') + 
+  ylab('Hour of Day (UTC)') + 
+  ggtitle('Best times to post on /r/samplesize', subtitle='based on percentage of times posts score over 10 points') +
+  theme(plot.subtitle=element_text(size=rel(0.7)),
+        legend.title=element_text(size=rel(0.7))) +
+  scale_x_discrete(label=function(x) substr(x,1,3))
+)
+dev.off()
+
+ppng('simple_time_tiles.png')
+print(
+ggplot(
+  dh_summary %>%
+   mutate(
+     label=sprintf(
+       '%s',
+       scales::percent(avg_score10, 0.1)
+     )
+   )
+  ) + 
+  geom_tile(aes(x=dow,y=hour3,fill=avg_score10)) +
+  scale_fill_gradientn(
+    '% of posts with\nscore>10',
+    colors=cet_pal(7, 'cbtd1'), 
+    label=scales::percent
+  ) + 
+  geom_text(aes(x=dow,y=hour3, label=label),
+            size=2) + 
+  theme_bw() + 
+  xlab('Day of Week') + 
+  ylab('Hour of Day (UTC)') + 
+  ggtitle('Best times to post on /r/samplesize', subtitle='based on percentage of times posts score over 10 points') +
+  theme(plot.subtitle=element_text(size=rel(0.7)),
+        legend.title=element_text(size=rel(0.7))) +
+  scale_x_discrete(label=function(x) substr(x,1,3))
+)
+dev.off()
+
+end.rcode-->
+
+<!--this is a tappable image that toggles between simple and detailed statistics-->
+<div id="time_grid_div">
+  <img src="figure/simple_time_tiles.png" id="time_grid_img"/>
+</div>
+
+<script>
+tap_state = 0;
+tap_images = [
+ 'figure/simple_time_tiles.png',
+ 'figure/detailed_time_tiles.png'
+];
+
+// main image tap
+$(function() {
+ $('#time_grid_img').click(function(){
+   tap_state = (tap_state + 1) % 2;
+   $("#time_grid_img").attr('src',tap_images[tap_state]);
+   return false;
+ });
+});
+</script>
+
+<style>
+ /*prevent highlighting image*/
+ #time_grid_img{
+    -khtml-user-select: none;
+    -o-user-select: none;
+    -moz-user-select: none;
+    -webkit-user-select: none;
+    user-select: none;
+ }
+</style>
+<!--end tappable image-->
+
+
+<p> The best times to post are generally in the morning for the US, around 12:00-15:00 UTC (or 7:00-10:00 am EST) Saturday </p>
+
+<p> Additionally, in an <a href="https://maxcandocia.com/article/2017/Oct/12/what-time-should-you-post-to-reddit-pt-2/" target="_blank" id="mc_when_to_post_to_reddit_2_out">earlier analysis for all of Reddit</a>, that time range was among the best for posting, although Saturday and Sunday morning in the US seems to be the best overall, with a wider time window for posting (up to 6 hours earlier and 3 hours later). Thursday does not appear to be a very good day for posting.</p>
+
+<p> See <a href="#caveats" id="caveats_goto">the limitations section at bottom of page</a> for why the above might not be a true cause-effect relationship.</p>
+
+<h1> Non-Time Effects </h1>
+<p> Although planning <i>when</i> to do the survey is important, one can alternately look at factors that improve the average score of a post. The below graph highlights the expected <i>percent increase</i> in score based on the following factors.</p>
+
+<h2> Effects on Score Value </h2>
+
+<!--begin.rcode coef_graph, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=9
+
+print(
+  ggplot(coef_data %>%
+           mutate(
+             coef_level = case_when(
+               category=='General' ~ stringr::str_to_title(gsub('_',' ', coef_level)),
+               TRUE ~ coef_level
+             )
+           )) + 
+  geom_bar(aes(x=coef_level,y=expm1(estimate)), fill='#9BCCEE', stat='identity') +
+  geom_errorbar(aes(x=coef_level , ymin=expm1(lower_est), 
+                    ymax=expm1(upper_est)), color='red') +
+  scale_y_continuous(label=scales::percent, breaks=seq(0,9,1)) +
+  coord_flip() +
+  facet_grid(category~., scales='free_y') +
+  theme_bw() +
+  geom_abline(slope=0, intercept=0, lty='dashed')+
+  theme(strip.text.y.right = element_text(angle = 0,size=rel(1.5)), axis.text.x=element_text(angle=30)) + 
+  ggtitle('Effect of /r/SampleSize characteristics on expected score', subtitle='red bars indicate 95% confidence interval') + 
+  xlab('') + ylab('Effect on Expected Score') + 
+    theme(axis.text.y=element_text(size=rel(1.2)))
+)
+
+end.rcode-->
+
+<h2> Effect on Odds of Score > 10 </h2>
+<!--begin.rcode coef_graph10, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=9
+
+print(
+  ggplot(coef_data10 %>%
+           mutate(
+             coef_level = case_when(
+               category=='General' ~ stringr::str_to_title(gsub('_',' ', coef_level)),
+               TRUE ~ coef_level
+             )
+           )) + 
+  geom_bar(aes(x=coef_level,y=(estimate)), fill='#EECC9B', stat='identity') +
+  geom_errorbar(aes(x=coef_level , ymin=(lower_est), 
+                    ymax=(upper_est)), color='red') +
+  coord_flip() +
+  facet_grid(category~., scales='free_y') +
+  theme_bw() +
+  geom_abline(slope=0, intercept=0, lty='dashed')+
+  theme(strip.text.y.right = element_text(angle = 0,size=rel(1.5)), axis.text.x=element_text(angle=30)) + 
+  ggtitle('Effect of /r/SampleSize characteristics on odds ratio of scoring >10', subtitle='red bars indicate 95% confidence interval') + 
+  xlab('') + ylab('Effect on Odds of Scoring > 10 Upvotes') + 
+    theme(axis.text.y=element_text(size=rel(1.2)))
+)
+
+end.rcode-->
+
+<p> The main takeaways: </p>
+
+<ol>
+<li> Reposting a survey reduces the expected score by about 14%. There is no apparent effect for repeated reposts. </li>
+ <li> If you've previously posted results, you get a "results flair", which gives you an average of 63% more upvotes on your posts. Posting results of a previous survey is one of the easiest ways to increase visibility without otherwise changing your survey or post, <b>and it cancels out the negative effect reposting has on the chance of scoring over 10 upvotes </b> </li>
+ <li> Results posts tend to do very well. Among actual survey posts, &ldquo;casual&rdquo; surveys tend to score about 66% higher than Academic. Marketing performs slightly worse by 9%.</li>
+ <li> Ignoring i.reddit.com (Reddit's image host sometimes used for results), surveys posted from <a href="strawpoll.me" id="strawpoll_me_out" target="_blank">strawpoll.me</a> tend to perform the best, although they only allow single questions. docs.google.com is the best for general surveys, although the effect is only about 25%. </li>
+
+ <li> Surveys that have an inclusive audience (i.e., "everybody") tend to score 20% better </li>
+ 
+ 
+ 
+</ol>
+
+<h1> Sampling Methodology </h1>
+
+<p> I used my <a href="https://maxcandocia.com/blog/2016/Dec/30/scraping-reddit-data/" id="maxcandocia_reddit_scraping" target="_blank">Tree Grabfor Reddit Scraper</a> (<a href="https://github.com/mcandocia/TreeGrabForReddit" id="github_treegrab_out" target="_blank">GitHub link</a>) to collect the most recent posts on <a href="https://old.reddit.com/r/samplesize" id="r_samplesize_out" target="_blank">/r/samplesize</a>, and then for each commenter/poster, look through their past 1,000 submissions to see which ones were submitted to <a href="https://old.reddit.com/r/samplesize" id="r_samplesize_out" target="_blank">/r/samplesize</a>. Posts from April 2020 and onwards were used, and must be at least 19 hours and 12 minutes old as of scraping (0.8 days). The number is a bit arbitrary, but most posts usually reach their maximum potential by that time.</p>
+
+<p> 7,533 posts from /r/samplesize were used in this analysis.</p>
+
+
+
+<h1 id="caveats"> Limitations of Analysis </h1>
+
+<p> In no particular order, here are some possible caveats to the above analysis: </p>
+
+<ul>
+ <li> The data is observational, as individuals posting to the subreddit generally do so when convenient. True causal effects are harder to identify and enumerate because of this. </li>
+ <li> Votes do not correlate 100% with responses to a survey. Usually you will get several times as many responses as upvotes, and the actual number is fudged by Reddit's anti-spam algorithm.</li>
+ <li> Individuals who post should have some idea when their target audience is awake. For example, someone targeting Americans would most likely not be posting at midnight local time. </li>
+ <li> There is some sampling bias with looking at the history of users who posted surveys in the past. This effect is somewhat limited by limiting the date range, but it is useful for taking a look at how successful reposts are.</li>
+</ul>
+
+<p> Additionally, there appears to be a higher proportion of casual posts on the weekends, and a lower proportion of marketing and academic posts. See the below table for proportion of posts by day of week:</p>
+
+<div id="prop_tbl_div" class="table-striped" style="max-width:700px">
+<!--begin.rcode prop_table, echo=FALSE, warning=FALSE, message=FALSE, results='asis'
+
+input_tbl =  (
+    table(df$dow, df$category) %>% prop.table() / rowSums(table(df$dow, df$category) %>% prop.table())
+  ) %>% 
+    as.data.frame.matrix() %>% 
+    mutate_all(scales::percent_format(0.1))
+
+rownames(input_tbl)=c('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+
+tbl = input_tbl %>% 
+  htmlTable::addHtmlTableStyle(css.class='table table-striped table-hover table-condensed table-responsive') %>% 
+  htmlTable::htmlTable() 
+
+cat('\n\n')
+cat(tbl)
+cat('\n\n')
+
+end.rcode-->
+
+</div>
+
+
+<h1> Modeling Methodology </h1>
+
+<p> For the effects of different post characteristics, I used a linear regression model using bidirectional stepwise selection (w/BIC). The response variable was <code>log(1+score)</code>, which doesn't perfectly correspond to number of votes on a log score, but it is close enough for general interpretation.</p>
+
+<h1> GitHub Code </h1>
+
+<p> Code and data used for the analysis can be found on <a href="https://github.com/mcandocia/samplesize_regression" id="git_samplesize_regression_out" target="_blank">https://github.com/mcandocia/samplesize_regression</a>.</p>
+
